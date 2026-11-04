@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grafana Firing Alerts Copy
 // @namespace    https://mdg-labs.dev/
-// @version      3.4.1
+// @version      3.5.0
 // @description  Copy button for the "Firing alerts" panel (Status dashboard): whole table or all rows of one alert
 // @match        https://grafana.mdg-labs.dev/*
 // @grant        GM_setClipboard
@@ -20,17 +20,10 @@
 
   const SEP = ',';         // CSV (values with commas, quotes or line breaks get quoted)
 
-  // ---- alerts that are routine work, not incidents: never framed as "investigate" ----
-  // Matched against the CATEGORY_FIELD column (exact alertname). Add more names here.
-  const UPDATE_ALERTS = [
-    'HostManualUpdatesPending',
-    'HostRebootRequired',
-  ];
-
   // ---- prompts wrapped around the copied CSV (for pasting into Claude Code) ----
-  // Placeholders: {{time}} = copy timestamp, {{csv}} = incident alerts, {{updates}} = UPDATE_ALERTS rows
+  // Placeholders: {{time}} = copy timestamp, {{csv}} = the data
 
-  // only incident alerts
+  // incident alerts (everything not listed in MAINTENANCE_ALERTS)
   const PROMPT = `These alerts are currently firing (copied {{time}}):
 
 \`\`\`csv
@@ -39,31 +32,24 @@
 
 Read the infra runbooks and investigate what's going on. Don't change anything yet - report your findings and proposed fixes first.`;
 
-  // only UPDATE_ALERTS
-  const PROMPT_UPDATES = `These are maintenance alerts (pending manual updates / reboot required), copied {{time}}:
+  // ---- maintenance alerts: routine work, never framed as "investigate" ----
+  // Key = exact alertname (CATEGORY_FIELD column). Each gets its own CSV block + task.
+  // Add more alerts here: { title: line above the CSV, task: what Claude should do }.
+  const MAINTENANCE_ALERTS = {
+    HostManualUpdatesPending: {
+      title: 'These hosts have pending manual updates:',
+      task: `Check the infra runbooks for what needs to be updated on each host, what the updates bring (notable changes, fixes, breaking changes) and whether there are prerequisites or follow-up steps. Then propose the update plan. Don't apply anything yet.`,
+    },
+    HostRebootRequired: {
+      title: 'These hosts need a reboot:',
+      task: `Check the infra runbooks for how to reboot each host: prerequisites (e.g. services to stop/drain, order between hosts), expected impact and how to verify it came back healthy. Then propose the reboot plan. Don't reboot anything yet.`,
+    },
+  };
 
-\`\`\`csv
-{{updates}}
-\`\`\`
-
-This is routine maintenance, not an incident - nothing to investigate. Read the infra runbooks, check per host which updates are pending and/or why a reboot is required, and propose a plan to apply them (order, reboots/restarts, impact on running services, anything risky). Don't apply or reboot anything yet.`;
-
-  // incident alerts + UPDATE_ALERTS mixed
-  const PROMPT_MIXED = `These alerts are currently firing (copied {{time}}):
-
-\`\`\`csv
-{{csv}}
-\`\`\`
-
-Read the infra runbooks and investigate what's going on. Don't change anything yet - report your findings and proposed fixes first.
-
-Separately, these are maintenance alerts (pending manual updates / reboot required):
-
-\`\`\`csv
-{{updates}}
-\`\`\`
-
-That part is routine maintenance, not an incident - don't investigate it (unless it is clearly related to the alerts above). Just list per host which updates are pending and/or why a reboot is required, and propose a plan to apply them, after the findings above.`;
+  // header when only maintenance alerts are copied
+  const MAINT_ONLY_INTRO = `Maintenance alerts (copied {{time}}). These are routine maintenance, not incidents - no need to investigate why they fire.`;
+  // separator when maintenance alerts follow incident alerts
+  const MAINT_MIXED_INTRO = `Separately, some maintenance alerts are firing. These are routine maintenance, not incidents - no need to investigate why they fire. Handle them after the findings above.`;
 
   const BTN_ID = 'gtc-btn';
   const MENU_ID = 'gtc-menu';
@@ -140,14 +126,18 @@ That part is routine maintenance, not an incident - don't investigate it (unless
       `UTC${s}${p(Math.floor(Math.abs(off) / 60))}:${p(Math.abs(off) % 60)}`;
   };
   const toText = (headers, rows, catIdx) => {
-    const isUpdate = (r) => UPDATE_ALERTS.includes(r[catIdx]);
-    const updates = rows.filter(isUpdate);
-    const others = rows.filter((r) => !isUpdate(r));
-    const tpl = !updates.length ? PROMPT : !others.length ? PROMPT_UPDATES : PROMPT_MIXED;
-    return tpl
-      .replace('{{time}}', stamp())
-      .replace('{{csv}}', () => toCsv(headers, others))
-      .replace('{{updates}}', () => toCsv(headers, updates));
+    const time = stamp();
+    const fill = (tpl, csv) => tpl.replace('{{time}}', time).replace('{{csv}}', () => csv);
+    const isMaint = (r) => Object.prototype.hasOwnProperty.call(MAINTENANCE_ALERTS, r[catIdx]);
+    const others = rows.filter((r) => !isMaint(r));
+    const maint = Object.entries(MAINTENANCE_ALERTS)
+      .map(([name, m]) => ({ m, rows: rows.filter((r) => r[catIdx] === name) }))
+      .filter((g) => g.rows.length)
+      .map(({ m, rows: rs }) => `${m.title}\n\n\`\`\`csv\n${toCsv(headers, rs)}\n\`\`\`\n\n${m.task}`);
+    const parts = [];
+    if (others.length) parts.push(fill(PROMPT, toCsv(headers, others)));
+    if (maint.length) parts.push(fill(others.length ? MAINT_MIXED_INTRO : MAINT_ONLY_INTRO, ''), ...maint);
+    return parts.join('\n\n');
   };
 
   // ---- UI ----
