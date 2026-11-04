@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grafana Firing Alerts Copy
 // @namespace    https://mdg-labs.dev/
-// @version      3.4.0
+// @version      3.4.1
 // @description  Copy button for the "Firing alerts" panel (Status dashboard): whole table or all rows of one alert
 // @match        https://grafana.mdg-labs.dev/*
 // @grant        GM_setClipboard
@@ -24,6 +24,7 @@
   // Matched against the CATEGORY_FIELD column (exact alertname). Add more names here.
   const UPDATE_ALERTS = [
     'HostManualUpdatesPending',
+    'HostRebootRequired',
   ];
 
   // ---- prompts wrapped around the copied CSV (for pasting into Claude Code) ----
@@ -39,13 +40,13 @@
 Read the infra runbooks and investigate what's going on. Don't change anything yet - report your findings and proposed fixes first.`;
 
   // only UPDATE_ALERTS
-  const PROMPT_UPDATES = `These hosts have pending manual updates (copied {{time}}):
+  const PROMPT_UPDATES = `These are maintenance alerts (pending manual updates / reboot required), copied {{time}}:
 
 \`\`\`csv
 {{updates}}
 \`\`\`
 
-This is routine maintenance, not an incident - nothing to investigate. Read the infra runbooks, check which updates are pending on each host and propose a plan to apply them (order, reboots/restarts needed, anything risky). Don't apply anything yet.`;
+This is routine maintenance, not an incident - nothing to investigate. Read the infra runbooks, check per host which updates are pending and/or why a reboot is required, and propose a plan to apply them (order, reboots/restarts, impact on running services, anything risky). Don't apply or reboot anything yet.`;
 
   // incident alerts + UPDATE_ALERTS mixed
   const PROMPT_MIXED = `These alerts are currently firing (copied {{time}}):
@@ -56,13 +57,13 @@ This is routine maintenance, not an incident - nothing to investigate. Read the 
 
 Read the infra runbooks and investigate what's going on. Don't change anything yet - report your findings and proposed fixes first.
 
-Separately, these hosts have pending manual updates:
+Separately, these are maintenance alerts (pending manual updates / reboot required):
 
 \`\`\`csv
 {{updates}}
 \`\`\`
 
-That part is routine maintenance, not an incident - don't investigate it (unless it is clearly related to the alerts above). Just list which updates are pending per host and propose a plan to apply them, after the findings above.`;
+That part is routine maintenance, not an incident - don't investigate it (unless it is clearly related to the alerts above). Just list per host which updates are pending and/or why a reboot is required, and propose a plan to apply them, after the findings above.`;
 
   const BTN_ID = 'gtc-btn';
   const MENU_ID = 'gtc-menu';
