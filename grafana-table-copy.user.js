@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grafana Firing Alerts Copy
 // @namespace    https://mdg-labs.dev/
-// @version      3.3.0
+// @version      3.4.0
 // @description  Copy button for the "Firing alerts" panel (Status dashboard): whole table or all rows of one alert
 // @match        https://grafana.mdg-labs.dev/*
 // @grant        GM_setClipboard
@@ -20,8 +20,16 @@
 
   const SEP = ',';         // CSV (values with commas, quotes or line breaks get quoted)
 
-  // ---- prompt wrapped around the copied CSV (for pasting into Claude Code) ----
-  // Placeholders: {{time}} = copy timestamp, {{csv}} = the data
+  // ---- alerts that are routine work, not incidents: never framed as "investigate" ----
+  // Matched against the CATEGORY_FIELD column (exact alertname). Add more names here.
+  const UPDATE_ALERTS = [
+    'HostManualUpdatesPending',
+  ];
+
+  // ---- prompts wrapped around the copied CSV (for pasting into Claude Code) ----
+  // Placeholders: {{time}} = copy timestamp, {{csv}} = incident alerts, {{updates}} = UPDATE_ALERTS rows
+
+  // only incident alerts
   const PROMPT = `These alerts are currently firing (copied {{time}}):
 
 \`\`\`csv
@@ -29,6 +37,32 @@
 \`\`\`
 
 Read the infra runbooks and investigate what's going on. Don't change anything yet - report your findings and proposed fixes first.`;
+
+  // only UPDATE_ALERTS
+  const PROMPT_UPDATES = `These hosts have pending manual updates (copied {{time}}):
+
+\`\`\`csv
+{{updates}}
+\`\`\`
+
+This is routine maintenance, not an incident - nothing to investigate. Read the infra runbooks, check which updates are pending on each host and propose a plan to apply them (order, reboots/restarts needed, anything risky). Don't apply anything yet.`;
+
+  // incident alerts + UPDATE_ALERTS mixed
+  const PROMPT_MIXED = `These alerts are currently firing (copied {{time}}):
+
+\`\`\`csv
+{{csv}}
+\`\`\`
+
+Read the infra runbooks and investigate what's going on. Don't change anything yet - report your findings and proposed fixes first.
+
+Separately, these hosts have pending manual updates:
+
+\`\`\`csv
+{{updates}}
+\`\`\`
+
+That part is routine maintenance, not an incident - don't investigate it (unless it is clearly related to the alerts above). Just list which updates are pending per host and propose a plan to apply them, after the findings above.`;
 
   const BTN_ID = 'gtc-btn';
   const MENU_ID = 'gtc-menu';
@@ -104,8 +138,16 @@ Read the infra runbooks and investigate what's going on. Don't change anything y
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())} ` +
       `UTC${s}${p(Math.floor(Math.abs(off) / 60))}:${p(Math.abs(off) % 60)}`;
   };
-  const toText = (headers, rows) =>
-    PROMPT.replace('{{time}}', stamp()).replace('{{csv}}', () => toCsv(headers, rows));
+  const toText = (headers, rows, catIdx) => {
+    const isUpdate = (r) => UPDATE_ALERTS.includes(r[catIdx]);
+    const updates = rows.filter(isUpdate);
+    const others = rows.filter((r) => !isUpdate(r));
+    const tpl = !updates.length ? PROMPT : !others.length ? PROMPT_UPDATES : PROMPT_MIXED;
+    return tpl
+      .replace('{{time}}', stamp())
+      .replace('{{csv}}', () => toCsv(headers, others))
+      .replace('{{updates}}', () => toCsv(headers, updates));
+  };
 
   // ---- UI ----
   function flash(btn, msg) {
@@ -140,7 +182,7 @@ Read the infra runbooks and investigate what's going on. Don't change anything y
       el.firstChild.textContent = label;
       el.addEventListener('click', (e) => {
         e.stopPropagation();
-        copy(btn, toText(t.headers, rows), n);
+        copy(btn, toText(t.headers, rows, t.catIdx), n);
         closeMenu();
       });
       menu.appendChild(el);
