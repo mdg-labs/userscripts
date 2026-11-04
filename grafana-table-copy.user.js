@@ -47,7 +47,7 @@ Read the infra runbooks and investigate what's going on. Don't change anything y
   };
 
   // header when only maintenance alerts are copied
-  const MAINT_ONLY_INTRO = `Maintenance alerts (copied {{time}}). These are routine maintenance, not incidents - no need to investigate why they fire.`;
+  const MAINT_ONLY_INTRO = `Maintenance alerts (copied {{time}}).`;
   // separator when maintenance alerts follow incident alerts
   const MAINT_MIXED_INTRO = `Separately, some maintenance alerts are firing. These are routine maintenance, not incidents - no need to investigate why they fire. Handle them after the findings above.`;
 
