@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GitHub Issue & PR Toolkit
 // @namespace    https://github.com/ghotso
-// @version      3.0.0
-// @description  Sub-Issue-Liste: zeigt status:* und safety-critical Labels jeder Sub-Issue an (gebündelter GraphQL-Request, PAT nötig; verschachtelte und repo-übergreifende Sub-Issues, Refresh-Bubble unten rechts). Copy-Button "<repo>#<nr>" im Header von Issues (auch im Sub-Issue-Sidepane) und Pull Requests.
+// @version      3.1.0
+// @description  Sub-Issue-Liste: zeigt status:* und safety-critical Labels jeder Sub-Issue an (gebündelter GraphQL-Request, PAT nötig; verschachtelte und repo-übergreifende Sub-Issues, Refresh-Bubble unten rechts, Warnung bei fehlendem/abgelaufenem/bald ablaufendem PAT). Copy-Button "<repo>#<nr>" im Header von Issues (auch im Sub-Issue-Sidepane) und Pull Requests.
 // @author       Michael
 // @match        https://github.com/*
 // @run-at       document-idle
@@ -32,13 +32,18 @@
     scanDebounceMs: 250,
     // Copy-Button: false = "repo#12", true = "owner/repo#12"
     copyIncludeOwner: false,
+    // Warnung anzeigen, wenn der PAT in weniger als so vielen Tagen abläuft
+    tokenExpiryWarnDays: 7,
   };
 
   const TOKEN_KEY = 'ghSubIssueLabelsPAT';
   const REFRESH_BTN_ID = 'subissue-labels-refresh-btn';
   const COPY_BTN_ATTR = 'data-copy-issue-ref';
 
-  GM_registerMenuCommand('GitHub PAT für Sub-Issue-Labels setzen', async () => {
+  const TOKEN_WARN_ID = 'subissue-labels-token-warning';
+  const MENU_SET_TOKEN = 'GitHub PAT für Sub-Issue-Labels setzen';
+
+  async function promptForToken() {
     const current = (await GM_getValue(TOKEN_KEY, '')) || '';
     const value = window.prompt(
       'GitHub Personal Access Token (Fine-grained, Berechtigung "Issues: Read-only" auf die Repos, oder classic mit "repo"/"public_repo" Scope):',
@@ -47,9 +52,44 @@
     if (value === null) return;
     await GM_setValue(TOKEN_KEY, value.trim());
     console.info('[gh-toolkit] Token gespeichert.');
+    setTokenState(value.trim() ? 'unknown' : 'missing');
     cache.clear();
     scheduleScan();
-  });
+  }
+
+  GM_registerMenuCommand(MENU_SET_TOKEN, promptForToken);
+
+  // ---------- Token-Status ----------
+
+  // 'unknown'  = gesetzt, noch nicht geprüft
+  // 'ok'       = letzter Request erfolgreich
+  // 'expiring' = gültig, läuft aber bald ab (Header github-authentication-token-expiration)
+  // 'missing'  = kein Token hinterlegt
+  // 'invalid'  = 401 Bad credentials -> abgelaufen, widerrufen oder falsch
+  const tokenState = { status: 'unknown', expiresAt: null };
+
+  function setTokenState(status, expiresAt = null) {
+    tokenState.status = status;
+    tokenState.expiresAt = expiresAt;
+    renderTokenWarning();
+  }
+
+  // "2026-12-01 10:00:00 UTC" / "... +0100" -> Date
+  function parseTokenExpiration(raw) {
+    if (!raw) return null;
+    const m = raw.trim().match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})\s*(UTC|[+-]\d{4})?$/);
+    if (!m) return null;
+    let tz = 'Z';
+    if (m[3] && m[3] !== 'UTC') tz = `${m[3].slice(0, 3)}:${m[3].slice(3)}`;
+    const d = new Date(`${m[1]}T${m[2]}${tz}`);
+    return isNaN(d) ? null : d;
+  }
+
+  function getHeader(rawHeaders, name) {
+    const re = new RegExp(`^${name}:\\s*(.*)$`, 'im');
+    const m = (rawHeaders || '').match(re);
+    return m ? m[1].trim() : null;
+  }
 
   function gmFetchJson(url, options) {
     return new Promise((resolve, reject) => {
@@ -61,12 +101,14 @@
         onload: (res) => {
           if (res.status >= 200 && res.status < 300) {
             try {
-              resolve(JSON.parse(res.responseText));
+              resolve({ json: JSON.parse(res.responseText), headers: res.responseHeaders || '' });
             } catch (e) {
               reject(new Error('Ungültige JSON-Antwort: ' + e.message));
             }
           } else {
-            reject(new Error(`HTTP ${res.status}: ${res.responseText.slice(0, 300)}`));
+            const err = new Error(`HTTP ${res.status}: ${res.responseText.slice(0, 300)}`);
+            err.status = res.status;
+            reject(err);
           }
         },
         onerror: () => reject(new Error('Netzwerkfehler beim GraphQL-Request')),
@@ -190,6 +232,7 @@
 
     const token = (await GM_getValue(TOKEN_KEY, '')) || '';
     if (!token) {
+      if (tokenState.status !== 'missing') setTokenState('missing');
       if (!warnedNoToken) {
         warnedNoToken = true;
         console.warn(
@@ -209,7 +252,7 @@
 
     try {
       const { query, aliasToRepo } = buildGraphQLQuery(refs);
-      const json = await gmFetchJson('https://api.github.com/graphql', {
+      const { json, headers } = await gmFetchJson('https://api.github.com/graphql', {
         method: 'POST',
         headers: {
           Authorization: `bearer ${token}`,
@@ -218,6 +261,11 @@
         },
         data: JSON.stringify({ query }),
       });
+
+      const expiresAt = parseTokenExpiration(getHeader(headers, 'github-authentication-token-expiration'));
+      const expiringSoon =
+        expiresAt && expiresAt.getTime() - Date.now() < CONFIG.tokenExpiryWarnDays * 24 * 60 * 60 * 1000;
+      setTokenState(expiringSoon ? 'expiring' : 'ok', expiresAt);
 
       if (json.errors) {
         // z.B. fehlende Berechtigung auf ein fremdes Repo -> restliche Daten trotzdem nutzen
@@ -240,6 +288,7 @@
       cache.set(pageKey, { ts: Date.now(), refsKey, labelsByKey });
       return labelsByKey;
     } catch (e) {
+      if (e.status === 401) setTokenState('invalid');
       console.error('[gh-toolkit] Request fehlgeschlagen:', e);
       return new Map();
     } finally {
@@ -328,6 +377,9 @@
     'M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z';
   const ICON_CHECK =
     'M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z';
+
+  const ICON_ALERT =
+    'M6.457 1.047c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0 1 14.082 15H1.918a1.75 1.75 0 0 1-1.543-2.575Zm1.763.707a.25.25 0 0 0-.44 0L1.698 13.132a.25.25 0 0 0 .22.368h12.164a.25.25 0 0 0 .22-.368Zm.53 3.996v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z';
 
   function buildIcon(d, size) {
     const NS = 'http://www.w3.org/2000/svg';
@@ -547,6 +599,103 @@
     // nur anzeigen, wenn die Seite überhaupt eine Sub-Issue-Liste hat
     const display = hasContainer ? 'flex' : 'none';
     if (btn.style.display !== display) btn.style.display = display;
+    renderTokenWarning();
+  }
+
+  // ---------- PAT-Warnung (neben der Refresh-Bubble) ----------
+
+  function formatDate(d) {
+    return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+  }
+
+  function getTokenWarningText() {
+    switch (tokenState.status) {
+      case 'missing':
+        return {
+          text: 'GitHub-PAT fehlt',
+          title: 'Kein GitHub-Token gesetzt – Sub-Issue-Labels können nicht geladen werden. Klicken zum Setzen.',
+          severe: true,
+        };
+      case 'invalid':
+        return {
+          text: 'GitHub-PAT abgelaufen/ungültig',
+          title:
+            'GitHub hat den Token abgelehnt (401 Bad credentials): abgelaufen, widerrufen oder falsch. Klicken, um einen neuen zu setzen.',
+          severe: true,
+        };
+      case 'expiring': {
+        const days = Math.max(0, Math.ceil((tokenState.expiresAt - Date.now()) / 86400000));
+        return {
+          text: days === 0 ? 'GitHub-PAT läuft heute ab' : `GitHub-PAT läuft in ${days} T. ab`,
+          title: `Token läuft ab am ${formatDate(tokenState.expiresAt)}. Klicken, um einen neuen zu setzen.`,
+          severe: false,
+        };
+      }
+      default:
+        return null;
+    }
+  }
+
+  function renderTokenWarning() {
+    if (!document.body) return;
+    const refreshBtn = document.getElementById(REFRESH_BTN_ID);
+    const visible = !!refreshBtn && refreshBtn.style.display !== 'none';
+    const info = visible ? getTokenWarningText() : null;
+    let pill = document.getElementById(TOKEN_WARN_ID);
+
+    if (!info) {
+      if (pill && pill.style.display !== 'none') pill.style.display = 'none';
+      return;
+    }
+
+    if (!pill) {
+      pill = document.createElement('button');
+      pill.id = TOKEN_WARN_ID;
+      pill.type = 'button';
+      Object.assign(pill.style, {
+        position: 'fixed',
+        right: '76px',
+        bottom: '26px',
+        height: '32px',
+        padding: '0 12px',
+        borderRadius: '16px',
+        border: '1px solid transparent',
+        boxShadow: '0 4px 12px rgba(0, 0, 0, 0.25)',
+        cursor: 'pointer',
+        alignItems: 'center',
+        gap: '6px',
+        font: '600 12px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+        whiteSpace: 'nowrap',
+        zIndex: '9999',
+      });
+      pill.appendChild(buildIcon(ICON_ALERT, 14));
+      pill.appendChild(document.createElement('span'));
+      pill.addEventListener('click', promptForToken);
+      document.body.appendChild(pill);
+    }
+
+    const sig = `${tokenState.status}|${info.text}`;
+    if (pill.dataset.sig !== sig) {
+      pill.dataset.sig = sig;
+      pill.lastChild.textContent = info.text;
+      pill.title = info.title;
+      pill.setAttribute('aria-label', info.title);
+      Object.assign(
+        pill.style,
+        info.severe
+          ? {
+              background: 'var(--bgColor-danger-emphasis, #cf222e)',
+              color: 'var(--fgColor-onEmphasis, #ffffff)',
+              borderColor: 'var(--borderColor-danger-emphasis, #cf222e)',
+            }
+          : {
+              background: 'var(--bgColor-attention-muted, #fff8c5)',
+              color: 'var(--fgColor-attention, #9a6700)',
+              borderColor: 'var(--borderColor-attention-emphasis, #bf8700)',
+            }
+      );
+    }
+    if (pill.style.display !== 'flex') pill.style.display = 'flex';
   }
 
   // ---------- Observer ----------
